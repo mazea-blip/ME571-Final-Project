@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DA3 Live 3D</title>
+<style>
+  :root { --bg: #0e0f12; --panel: rgba(24, 26, 31, 0.9); --text: #e7e9ee; --muted: #9aa0ab; --accent: #f2a541; --warn: #f2a541; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #panel { position: fixed; top: 12px; left: 12px; background: var(--panel); border-radius: 10px;
+    padding: 12px 14px; display: grid; gap: 10px; width: 270px; backdrop-filter: blur(6px); }
+  .seg { display: inline-flex; background: #2a2d35; border-radius: 7px; padding: 3px; gap: 2px; }
+  .seg button { font: inherit; border: 0; background: transparent; color: var(--muted); padding: 5px 10px; border-radius: 5px; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: #454a56; color: var(--text); font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+  button.plain { font: inherit; color: var(--text); background: #2a2d35; border: 1px solid #3a3e48; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  label { display: grid; gap: 4px; color: var(--muted); }
+  #stats { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--text); display: grid; gap: 2px; }
+  #stats .muted { color: var(--muted); }
+  #note { color: var(--warn); font-size: 12px; }
+  #help { position: fixed; bottom: 12px; left: 12px; color: var(--muted); font-size: 12px; }
+  #conn { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 15px; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <div class="seg" role="group" aria-label="3D mode">
+    <button type="button" id="mode-live" data-mode="live" aria-pressed="true">Live frame</button>
+    <button type="button" id="mode-map" data-mode="map" aria-pressed="false">Build map</button>
+  </div>
+  <div class="row">
+    <button type="button" class="plain" id="clear">Clear map</button>
+    <button type="button" class="plain" id="reset">Reset view</button>
+  </div>
+  <label>Point size <input id="size" type="range" min="0.5" max="8" step="0.1" value="2.5"></label>
+  <div id="stats"><span class="muted">waiting for live.py…</span></div>
+  <div id="note" hidden></div>
+</div>
+<div id="help">Drag: orbit · Right-drag: pan · Scroll: zoom · Orange: camera and its path. In map mode, move the camera slowly.</div>
+<div id="conn" hidden>Not connected. Start it with <code>&nbsp;uv run live.py&nbsp;</code></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (id) => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // colours are already sRGB
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e0f12);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 200);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+function resetView() { camera.position.set(0, 0.25, 0.7); controls.target.set(0, 0, -1); controls.update(); }
+resetView();
+
+const pointMat = new THREE.PointsMaterial({ vertexColors: true, sizeAttenuation: true });
+const setSize = () => { pointMat.size = 0.0025 * Number($("size").value); };
+setSize();
+
+// live frame: preallocated buffers, refilled every frame
+const MAX_LIVE = 250000;
+const liveGeo = new THREE.BufferGeometry();
+const livePos = new THREE.BufferAttribute(new Float32Array(MAX_LIVE * 3), 3).setUsage(THREE.DynamicDrawUsage);
+const liveCol = new THREE.BufferAttribute(new Uint8Array(MAX_LIVE * 3), 3, true).setUsage(THREE.DynamicDrawUsage);
+liveGeo.setAttribute("position", livePos);
+liveGeo.setAttribute("color", liveCol);
+liveGeo.setDrawRange(0, 0);
+const livePts = new THREE.Points(liveGeo, pointMat);
+livePts.frustumCulled = false;
+scene.add(livePts);
+
+// map: one static Points object per keyframe
+const mapGroup = new THREE.Group();
+scene.add(mapGroup);
+let mapPoints = 0;
+function clearMap() {
+  for (const p of mapGroup.children) p.geometry.dispose();
+  mapGroup.clear();
+  mapPoints = 0;
+}
+function addChunk(xyz, rgb) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(xyz, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(rgb, 3, true));
+  const p = new THREE.Points(g, pointMat);
+  p.frustumCulled = false;
+  mapGroup.add(p);
+  mapPoints += xyz.length / 3;
+}
+
+// camera frustum + path
+const orange = new THREE.LineBasicMaterial({ color: 0xf2a541 });
+const f = 0.12, a = 16 / 9, zf = -0.18;
+const c = [[-f * a, f, zf], [f * a, f, zf], [f * a, -f, zf], [-f * a, -f, zf]];
+const segs = [];
+for (const p of c) segs.push(0, 0, 0, ...p);
+for (let i = 0; i < 4; i++) segs.push(...c[i], ...c[(i + 1) % 4]);
+segs.push(-f * a * 0.4, f, zf, 0, f * 1.5, zf, 0, f * 1.5, zf, f * a * 0.4, f, zf); // "up" marker
+const frustumGeo = new THREE.BufferGeometry();
+frustumGeo.setAttribute("position", new THREE.Float32BufferAttribute(segs, 3));
+const frustum = new THREE.LineSegments(frustumGeo, orange);
+frustum.matrixAutoUpdate = false;
+scene.add(frustum);
+const pathGeo = new THREE.BufferGeometry();
+const path = new THREE.Line(pathGeo, orange);
+path.frustumCulled = false;
+scene.add(path);
+let pathCount = -1;
+
+// mode buttons
+async function send(cmd) {
+  try { await fetch("/cmd", { method: "POST", body: JSON.stringify(cmd) }); } catch {}
+}
+for (const b of document.querySelectorAll(".seg button")) b.onclick = () => send({ mode: b.dataset.mode });
+$("clear").onclick = () => send({ clear: true });
+$("reset").onclick = resetView;
+$("size").oninput = setSize;
+
+function showStats(s, live) {
+  const rows = [
+    `${s.model} · ${s.res} px`,
+    `${(s.fps || 0).toFixed(1)} fps · model ${s.ms} ms`,
+    s.mode === "map" ? `map: ${s.keyframes} keyframes · ${(mapPoints / 1e6).toFixed(2)}M pts` : `live frame: ${live.toLocaleString()} pts`,
+  ];
+  $("stats").replaceChildren(...rows.map((t) => { const d = document.createElement("span"); d.textContent = t; return d; }));
+  for (const b of document.querySelectorAll(".seg button")) b.setAttribute("aria-pressed", String(b.dataset.mode === s.requested));
+  $("note").hidden = !s.note;
+  $("note").textContent = s.note || "";
+}
+
+let lastId = 0, epoch = -1, have = 0;
+function handle(buf) {
+  const dv = new DataView(buf);
+  const hlen = dv.getUint32(0, true);
+  const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hlen)));
+  let off = 4 + hlen;
+  const take = (n) => {
+    const xyz = new Float32Array(buf, off, n * 3); off += n * 12;
+    const rgb = new Uint8Array(buf, off, n * 3); off += n * 3; off += (4 - (off % 4)) % 4;
+    return [xyz, rgb];
+  };
+  if (hdr.reset) { clearMap(); have = 0; }
+  epoch = hdr.epoch;
+  const n = Math.min(hdr.live, MAX_LIVE);
+  const [lx, lc] = take(hdr.live);
+  livePos.array.set(lx.subarray(0, n * 3)); livePos.needsUpdate = true;
+  liveCol.array.set(lc.subarray(0, n * 3)); liveCol.needsUpdate = true;
+  liveGeo.setDrawRange(0, n);
+  for (const m of hdr.chunks) { const [x, col] = take(m); addChunk(x.slice(), col.slice()); }
+  have = hdr.chunkStart + hdr.chunks.length;
+  lastId = hdr.id;
+  if (hdr.pose) { frustum.matrix.set(...hdr.pose.flat()); frustum.visible = true; }
+  if (hdr.path.length !== pathCount) {
+    pathCount = hdr.path.length;
+    pathGeo.setAttribute("position", new THREE.Float32BufferAttribute(hdr.path.flat(), 3));
+    path.visible = pathCount > 1;
+  }
+  if (hdr.stats && hdr.stats.model) showStats(hdr.stats, n);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function poll() {
+  for (;;) {
+    try {
+      const r = await fetch(`/frame?after=${lastId}&epoch=${epoch}&have=${have}`, { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      handle(await r.arrayBuffer());
+      $("conn").hidden = true;
+    } catch {
+      $("conn").hidden = false;
+      await sleep(1000);
+    }
+  }
+}
+poll();
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
