@@ -35,19 +35,34 @@ Models download from Hugging Face on first use. Put photos and clips in `footage
 |---|---|
 | `tools/depth.py` | Depth maps for photos; depth videos, point clouds and camera paths for short clips |
 | `tools/compare.py` | Runs four DA3 models on the same frames and measures how much they disagree |
-| `tools/live.py` + `web/live3d.html` | Webcam depth, live, with a browser 3D view |
+| `tools/live.py` + `web/live3d.html` | Webcam depth, live, with the belt's motor zones and a browser 3D view |
 
 ## Live webcam
 
 ```sh
 uv run tools/live.py
+uv run tools/live.py --model 5                    # metric model: distances in metres
 uv run tools/live.py --source footage/Photos-1-001/PXL_20261116_161842089.mp4 --headless 120   # timing, no camera
 ```
 
-Opens a camera window, a depth window and the 3D view at http://127.0.0.1:8766. Keys: `1`–`4` model,
-`r` input size, `s` flicker smoothing, `m` 3D mode (live frame / build map), `c` clear the map, `q` quit.
-`--source` takes a camera index (default `0`, the built-in camera) or a video file. On an M4 Pro,
-DA3-BASE runs at about 18 fps at 392 px and DA3-SMALL at about 30.
+Opens a camera window, a depth window and the 3D view at http://127.0.0.1:8766. Keys: `1`–`5` model,
+`r` input size, `s` flicker smoothing, `m` 3D mode (live frame / build map), `c` clear the map, `z` belt
+zones, `q` quit. `--source` takes a camera index (default `0`, the built-in camera) or a video file. On an
+M4 Pro, DA3-BASE runs at about 18 fps at 392 px and DA3-SMALL at about 30.
+
+Both windows show the belt's four motor zones (Left, Mid-Left, Mid-Right, Right) in a band at waist
+height. Each zone covers a fifth of the image width, and the middle fifth is left out. A zone turns red
+when its nearest 10% of pixels is closer than `--zone-near` (default 0.5) times the frame's median depth;
+the number shown in each zone is that ratio. Webcams are mirrored by default and the zones follow the
+camera's own left and right; pass `--no-mirror` for a chest camera. `--headless` also prints how often
+each zone alerted.
+
+Model `5`, DA3METRIC-LARGE, gives metres: `metres = focal length × output / 300`, with the focal length in
+pixels at the model's input size. The focal length comes from the camera's horizontal field of view,
+`--hfov` (default 75°, a guess for a laptop webcam; `--hfov 93` for the belt camera at 1280×720, see
+[docs/design.md](docs/design.md#hardware)). A wrong field of view scales every distance by the same
+factor, so check against a tape measure. With it, the zones show metres and alert when their nearest part
+is closer than `--zone-metres` (default 1.0).
 
 ## Depth maps and short clips
 
@@ -80,3 +95,4 @@ Writes depth maps, disagreement overlays and `metrics.json` to `outputs/compare/
 | DA3-BASE | 0.12B | Closest to LARGE in our comparison at under half the cost | Apache 2.0 |
 | DA3MONO-LARGE | 0.35B | Single image only, no camera estimate | Apache 2.0 |
 | DA3-LARGE-1.1 | 0.35B | Default for `depth.py` | CC BY-NC 4.0 per the DA3 README (Hugging Face lists Apache 2.0) |
+| DA3METRIC-LARGE | 0.35B | Single image, depth in metres given the focal length; key `5` in `live.py` | Apache 2.0 |

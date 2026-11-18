@@ -51,7 +51,7 @@ buzz.
 
 | Part | Pre-proposal spec | Notes |
 |---|---|---|
-| Chest camera | 720p USB, 100° lens, angled ~10° down | |
+| Chest camera | 720p USB, 100° lens, angled ~10° down | ELP-USB100W07M-MHV100: OV9712 sensor, 1280×720, M7 lens sold as 100° but 93° horizontal and 98° diagonal per its spec sheet, so `--hfov 93` and a focal length of about 607 px at 1280 px wide. 30 fps at 1280×720 only in MJPEG (5 fps in YUY2). |
 | ToF sensors | 2× VL53L1X at the hips, angled ~30° outward, 0–4 m | Shared I2C bus; separate XSHUT pins give each a unique address at startup. A third is kept as a spare. |
 | Controller | Raspberry Pi (a Pi 5 in the risk estimates) | Pocket unit, with the battery |
 | Power | 5 V / 3 A, 10,000 mAh bank in a vented pocket enclosure | About 3–4 hours of use |
@@ -89,11 +89,13 @@ with the 5–10 fps the pre-proposal expected from YOLOv8n on a Pi 5.
 ## Open questions
 
 - **Metres from the camera.** DA3-SMALL, BASE and LARGE give relative depth, but the motor mapping needs
-  real distances. Options: `DA3METRIC-LARGE` (in the pinned DA3 version; needs the camera's focal length),
-  or scaling the relative depth with the ToF readings in the Left and Right zones.
+  real distances. Options: `DA3METRIC-LARGE` (needs the camera's focal length; model `5` in
+  `tools/live.py`, accuracy not yet checked against a tape measure), or scaling the relative depth with
+  the ToF readings in the Left and Right zones.
 - **Belt-to-laptop link.** How camera frames reach the laptop and zone distances get back to the Pi isn't
   decided. Its delay adds to every camera-based warning.
 - **Which ToF sensor.** The pre-proposal text names the VL53L1X (one distance per sensor); its Fig. 1
   labels the VL53L5CX (an 8×8 grid of distances per sensor).
 - **Zone boundaries.** The pre-proposal doesn't give the angle each zone covers or how wide the central
-  gap is.
+  gap is. `tools/live.py` starts with equal fifths of the image width (the middle fifth is the gap) in a
+  band from 35% to 65% of the image height, measured in pixels rather than angles.
