@@ -2,6 +2,7 @@
 
     uv run tools/live.py           # MacBook camera, starts on DA3-BASE at 392 px
     uv run tools/live.py --model 1 --res 280
+    uv run tools/live.py --model 5 --hfov 93 --no-mirror --source 1   # metres, belt camera (ELP, 93° wide)
 
 Windows: the camera, the depth map with a speed readout, and a browser tab with the
 live 3D point cloud (http://127.0.0.1:8766). The 3D view has two modes:
@@ -16,8 +17,14 @@ when its nearest 10% of pixels is closer than --zone-near (default 0.5) times th
 median depth; the number in each zone is that ratio. Left and right are the camera's own
 view, so they stay right when the picture is mirrored. Use --no-mirror for a chest camera.
 
+Metres: models 1-4 give relative depth (right shape, unknown scale). Model 5, DA3METRIC-LARGE,
+gives metres: metres = focal length (pixels, at the model's input size) x output / 300. The
+focal length comes from the camera's horizontal field of view, --hfov (default 75°, a guess:
+a wrong field of view scales every distance). With it the zones show metres and alert when
+their nearest part is closer than --zone-metres (default 1.0).
+
 Keys (with the camera or depth window focused):
-    1 2 3 4   switch model: SMALL, BASE, MONO-LARGE, LARGE-1.1 (first switch loads it)
+    1 2 3 4 5 switch model: SMALL, BASE, MONO-LARGE, LARGE-1.1, METRIC-LARGE (first switch loads it)
     r         cycle input resolution 280 / 392 / 504 px
     s         toggle flicker smoothing (depth window)
     m         toggle 3D mode: live frame / build map
@@ -60,12 +67,15 @@ MODELS = {
     "2": "depth-anything/DA3-BASE",
     "3": "depth-anything/DA3MONO-LARGE",
     "4": "depth-anything/DA3-LARGE-1.1",
+    "5": "depth-anything/DA3METRIC-LARGE",
 }
-HAS_POSE = {"1", "2", "4"}  # MONO-LARGE has no camera head
+HAS_POSE = {"1", "2", "4"}  # MONO-LARGE and METRIC-LARGE have no camera head
+METRIC = {MODELS["5"]}      # depth in metres once scaled by the focal length
+METRIC_FOCAL = 300.0        # DA3METRIC-LARGE: metres = focal (px) x output / 300
 RESOLUTIONS = [280, 392, 504]
 PATCH = 14
 STRIDE = 2               # 3D: keep every 2nd pixel in each direction
-FALLBACK_HFOV = 75.0     # degrees, for models that don't predict intrinsics
+FALLBACK_HFOV = 75.0     # degrees, default --hfov, for models that don't predict intrinsics
 MAX_KEYFRAMES = 120
 KEYFRAME_ANGLE = 10.0    # degrees of rotation from the last keyframe before adding a new one
 KEYFRAME_DIST = 0.15     # translation (in units of the first frame's median depth)
@@ -96,8 +106,9 @@ class Result:
 class DepthEngine:
     """Loads models on demand, runs them, and turns depth into colours and 3D points."""
 
-    def __init__(self, device: str):
+    def __init__(self, device: str, hfov: float = FALLBACK_HFOV):
         self.device = device
+        self.hfov = hfov  # camera's horizontal field of view, for models that don't predict it
         self.models: dict[str, DepthAnything3] = {}
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
@@ -128,8 +139,12 @@ class DepthEngine:
         out = self.model(name).forward(torch.stack(xs)[None], None, None, [], False, False, "first")
         n, (h, w) = len(xs), xs[0].shape[-2:]
         get = lambda k, shape: out[k].float().reshape(shape).cpu().numpy() if k in out else None  # noqa: E731
-        return Result(get("depth", (n, h, w)), get("depth_conf", (n, h, w)),
-                      get("extrinsics", (n, 3, 4)), get("intrinsics", (n, 3, 3)))
+        depth, K = get("depth", (n, h, w)), get("intrinsics", (n, 3, 3))
+        if K is None:  # MONO-LARGE and METRIC-LARGE don't predict intrinsics: use --hfov
+            K = np.repeat(fallback_K(h, w, self.hfov)[None], n, axis=0)
+        if name in METRIC:  # focal length in pixels at the model's input size
+            depth = depth * ((K[:, 0, 0] + K[:, 1, 1]) / 2 / METRIC_FOCAL)[:, None, None]
+        return Result(depth, get("depth_conf", (n, h, w)), get("extrinsics", (n, 3, 4)), K)
 
     def depth(self, name: str, rgb: np.ndarray, res: int) -> np.ndarray:
         return self.run(name, [self.prep(rgb, res)[0]]).depth[0]
@@ -182,27 +197,29 @@ class Zone:
     name: str
     x0: float    # left and right edges, as fractions of the displayed image width
     x1: float
-    near: float  # zone distance / frame median depth
+    near: float  # zone distance: metres if `metres`, else / frame median depth
     alert: bool
+    metres: bool = False
 
 
-def zone_states(depth: np.ndarray, near_frac: float, mirrored: bool) -> list[Zone]:
-    """Each zone's distance relative to the frame's median depth. A zone alerts when its
-    nearest part is closer than near_frac x the median. depth is as displayed; when the
-    display is mirrored, the camera's Left zone is on the right of it."""
+def zone_states(depth: np.ndarray, threshold: float, mirrored: bool, metres: bool = False) -> list[Zone]:
+    """Each zone's distance: in metres when the depth is metric, else relative to the frame's
+    median depth. A zone alerts when its nearest part is closer than threshold (metres, or
+    x the median). depth is as displayed; when the display is mirrored, the camera's Left zone
+    is on the right of it."""
     h, w = depth.shape
     band = depth[int(h * ZONE_BAND[0]):int(h * ZONE_BAND[1])]
-    median = max(float(np.median(depth)), 1e-6)
+    unit = 1.0 if metres else max(float(np.median(depth)), 1e-6)
     zones = []
     for name, a, b in ZONES:
         x0, x1 = (1 - b, 1 - a) if mirrored else (a, b)
-        near = float(np.percentile(band[:, int(w * x0):int(w * x1)], ZONE_PERCENTILE)) / median
-        zones.append(Zone(name, x0, x1, near, near < near_frac))
+        near = float(np.percentile(band[:, int(w * x0):int(w * x1)], ZONE_PERCENTILE)) / unit
+        zones.append(Zone(name, x0, x1, near, near < threshold, metres))
     return zones
 
 
-def fallback_K(h: int, w: int) -> np.ndarray:
-    f = (w / 2) / np.tan(np.radians(FALLBACK_HFOV / 2))
+def fallback_K(h: int, w: int, hfov: float = FALLBACK_HFOV) -> np.ndarray:
+    f = (w / 2) / np.tan(np.radians(hfov / 2))
     return np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], np.float32)
 
 
@@ -350,6 +367,7 @@ class Worker(threading.Thread):
         self.model_key, self.res, self.smooth = model_key, res, smooth
         self.mode = "live"
         self.zone_near = 0.5       # alert threshold, as a fraction of the frame's median depth
+        self.zone_metres = 1.0     # alert threshold in metres, for metric models
         self.mirrored = False      # whether submitted frames are mirrored
         self.lock = threading.Lock()
         self.frame = None
@@ -386,8 +404,7 @@ class Worker(threading.Thread):
     def live_step(self, name, x, colours):
         r = self.engine.run(name, [x])
         depth = r.depth[0]
-        h, w = depth.shape
-        K = r.K[0] if r.K is not None else fallback_K(h, w)
+        K = r.K[0]
         # intrinsics are predicted per frame; smooth the focal length so the cloud doesn't breathe
         self.K_ema = K if self.K_ema is None else 0.9 * self.K_ema + 0.1 * K
         d = depth / np.median(depth)
@@ -457,7 +474,8 @@ class Worker(threading.Thread):
                 depth, pts, cols, pose, chunk, path_point = step(name, x, colours)
                 ms = (time.perf_counter() - t0) * 1000
                 vis = self.engine.colourise(depth, smooth)
-                zones = zone_states(depth, self.zone_near, self.mirrored)
+                metric = name in METRIC
+                zones = zone_states(depth, self.zone_metres if metric else self.zone_near, self.mirrored, metric)
             except Exception as e:  # show it in the window instead of silently freezing
                 self.status = f"error: {type(e).__name__}: {e}"[:90]
                 print(self.status, flush=True)
@@ -512,7 +530,7 @@ def draw_zones(img: np.ndarray, zones: list[Zone]) -> None:
         x0, x1 = int(w * z.x0), int(w * z.x1) - 1
         colour = (0, 0, 255) if z.alert else (230, 230, 230)
         cv2.rectangle(img, (x0, y0), (x1, y1), colour, 3 if z.alert else 1)
-        for text, y in ((z.name, y1 - 34), (f"{z.near:.2f}", y1 - 10)):
+        for text, y in ((z.name, y1 - 34), (f"{z.near:.2f}{' m' if z.metres else ''}", y1 - 10)):
             cv2.putText(img, text, (x0 + 8, y), font, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.putText(img, text, (x0 + 8, y), font, 0.6, colour, 2 if z.alert else 1, cv2.LINE_AA)
 
@@ -554,6 +572,7 @@ def headless(args, engine: DepthEngine) -> None:
     worker = Worker(engine, hub, args.model, args.res, args.smooth)
     worker.mode = args.mode
     name = MODELS[args.model]
+    metric = name in METRIC
     times, n_pts = [], []
     alerts, nearest = {z[0]: 0 for z in ZONES}, {z[0]: [] for z in ZONES}
     for i in range(args.headless):
@@ -566,7 +585,7 @@ def headless(args, engine: DepthEngine) -> None:
         step = worker.map_step if args.mode == "map" and args.model in HAS_POSE else worker.live_step
         depth, pts, cols, pose, chunk, path_point = step(name, x, colours)
         engine.colourise(depth, args.smooth)
-        for z in zone_states(depth, args.zone_near, mirrored=False):
+        for z in zone_states(depth, args.zone_metres if metric else args.zone_near, False, metric):
             alerts[z.name] += z.alert
             nearest[z.name].append(z.near)
         if pts is not None:
@@ -579,14 +598,19 @@ def headless(args, engine: DepthEngine) -> None:
           f"= {1 / np.median(times):.1f} fps; {int(np.median(n_pts))} points/frame; "
           f"{worker.n_keyframes} keyframes, {len(hub.chunks)} map chunks; payload {len(payload) / 1e6:.1f} MB")
     n = len(nearest[ZONES[0][0]])
-    print(f"zones (alert < {args.zone_near:.2f}x median depth), alerts out of {n} frames: " + ", ".join(
-        f"{k} {alerts[k]} (ratio {np.min(v):.2f}-{np.max(v):.2f})" for k, v in nearest.items()))
+    rule = f"{args.zone_metres:.2f} m (hfov {args.hfov:.0f}°)" if metric else f"{args.zone_near:.2f}x median depth"
+    unit = (" m", "nearest") if metric else ("", "ratio")
+    print(f"zones (alert < {rule}), alerts out of {n} frames: " + ", ".join(
+        f"{k} {alerts[k]} ({unit[1]} {np.min(v):.2f}-{np.max(v):.2f}{unit[0]})" for k, v in nearest.items()))
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", default="0", help="camera index or video file (default: 0, the built-in camera)")
-    p.add_argument("--model", default="2", choices=list(MODELS), help="1 SMALL, 2 BASE, 3 MONO-LARGE, 4 LARGE-1.1")
+    p.add_argument("--model", default="2", choices=list(MODELS),
+                   help="1 SMALL, 2 BASE, 3 MONO-LARGE, 4 LARGE-1.1, 5 METRIC-LARGE (metres)")
+    p.add_argument("--hfov", type=float, default=FALLBACK_HFOV, metavar="DEG",
+                   help="camera's horizontal field of view; sets the metric model's scale (default: %(default)s)")
     p.add_argument("--res", type=int, default=392, choices=RESOLUTIONS)
     p.add_argument("--mode", default="live", choices=["live", "map"], help="starting 3D mode")
     p.add_argument("--no-smooth", dest="smooth", action="store_false", help="start with smoothing off")
@@ -598,12 +622,14 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8766)
     p.add_argument("--zone-near", type=float, default=0.5, metavar="F",
                    help="a belt zone alerts when its nearest part is closer than F x the frame's median depth")
+    p.add_argument("--zone-metres", type=float, default=1.0, metavar="M",
+                   help="with the metric model, a zone alerts when its nearest part is closer than M metres")
     p.add_argument("--no-zones", dest="zones", action="store_false", help="start with the belt zones hidden")
     p.add_argument("--headless", type=int, metavar="N", help="process N frames without windows and print timing")
     args = p.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-    engine = DepthEngine(device)
+    engine = DepthEngine(device, args.hfov)
     print(f"loading {MODELS[args.model]} on {device}", flush=True)
     engine.model(MODELS[args.model])
     if args.headless:
@@ -614,7 +640,7 @@ def main() -> None:
     worker = Worker(engine, hub, args.model, args.res, args.smooth)
     worker.mode = args.mode
     mirror = args.mirror and args.source.isdigit()
-    worker.zone_near, worker.mirrored = args.zone_near, mirror
+    worker.zone_near, worker.zone_metres, worker.mirrored = args.zone_near, args.zone_metres, mirror
     worker.start()
     if args.web:
         serve(hub, args.port)
@@ -628,7 +654,7 @@ def main() -> None:
     depth_img, shown_id, zones = None, -1, []
     show_zones = args.zones
     last_log = time.perf_counter()
-    footer = "1-4 model  r res  s smooth  m 3D mode  c clear map  z zones  q quit"
+    footer = "1-5 model  r res  s smooth  m 3D mode  c clear map  z zones  q quit"
     print("Keys" + __doc__.split("Keys")[1].split("Test without")[0].rstrip(), flush=True)
 
     while True:
@@ -660,16 +686,21 @@ def main() -> None:
                  if worker.fps is not None and worker.status == "running" else worker.status)
         mode = (f"3D: map, {worker.n_keyframes} keyframes" if worker.mode == "map" else "3D: live frame")
         lines = [f"{name}   {worker.res} px   smoothing {'on' if worker.smooth else 'off'}", speed, mode]
+        metric = MODELS[worker.model_key] in METRIC
+        if metric:
+            lines.append(f"metres, assuming a {engine.hfov:.0f}° field of view (--hfov)")
         if show_zones:
-            lines.append(f"zones: alert < {worker.zone_near:.2f}x median depth")
+            lines.append(f"zones: alert < {worker.zone_metres:.2f} m" if metric
+                         else f"zones: alert < {worker.zone_near:.2f}x median depth")
         if worker.note:
             lines.append(worker.note)
         draw_hud(canvas, lines, footer)
         cv2.imshow(DEPTH_WIN, canvas)
         if time.perf_counter() - last_log > 5:
             alerting = ", ".join(z.name for z in zones if z.alert) or "none"
+            dists = "; nearest: " + ", ".join(f"{z.name} {z.near:.2f} m" for z in zones) if zones and zones[0].metres else ""
             print(f"{name} {worker.res}px smoothing {'on' if worker.smooth else 'off'} {mode}: {speed}; "
-                  f"zone alerts: {alerting}", flush=True)
+                  f"zone alerts: {alerting}{dists}", flush=True)
             last_log = time.perf_counter()
 
         if not placed:  # put the windows next to each other once, then leave them where the user drags them
