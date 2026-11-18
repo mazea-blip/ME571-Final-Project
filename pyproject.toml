@@ -1,0 +1,19 @@
+[project]
+name = "me571-final-project"
+version = "0.1.0"
+description = "Haptic Peripheral Vision Assist: depth estimation for a wearable obstacle-sensing belt"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "addict>=2.4.0",
+    "depth-anything-3",
+    "matplotlib",
+]
+
+[tool.uv]
+package = false
+# DA3 lists xformers as a hard dependency, but xformers has no macOS wheels and
+# DA3 falls back to a plain PyTorch SwiGLU when it is missing. Keep it Linux-only.
+override-dependencies = ["xformers; sys_platform == 'linux'"]
+
+[tool.uv.sources]
+depth-anything-3 = { git = "https://github.com/ByteDance-Seed/Depth-Anything-3.git", rev = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4" }

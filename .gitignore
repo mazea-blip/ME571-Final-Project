@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.DS_Store
+
+# generated maps, depth videos and model caches (can be many GB)
+outputs/
+
+# source footage stays local
+footage/
+*.mp4
+*.MP4
+*.mov
+*.MOV
