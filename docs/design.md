@@ -96,4 +96,5 @@ with the 5–10 fps the pre-proposal expected from YOLOv8n on a Pi 5.
 - **Which ToF sensor.** The pre-proposal text names the VL53L1X (one distance per sensor); its Fig. 1
   labels the VL53L5CX (an 8×8 grid of distances per sensor).
 - **Zone boundaries.** The pre-proposal doesn't give the angle each zone covers or how wide the central
-  gap is.
+  gap is. `tools/live.py` starts with equal fifths of the image width (the middle fifth is the gap) in a
+  band from 35% to 65% of the image height, measured in pixels rather than angles.

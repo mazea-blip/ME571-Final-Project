@@ -35,7 +35,7 @@ Models download from Hugging Face on first use. Put photos and clips in `footage
 |---|---|
 | `tools/depth.py` | Depth maps for photos; depth videos, point clouds and camera paths for short clips |
 | `tools/compare.py` | Runs four DA3 models on the same frames and measures how much they disagree |
-| `tools/live.py` + `web/live3d.html` | Webcam depth, live, with a browser 3D view |
+| `tools/live.py` + `web/live3d.html` | Webcam depth, live, with the belt's motor zones and a browser 3D view |
 
 ## Live webcam
 
@@ -45,9 +45,16 @@ uv run tools/live.py --source footage/Photos-1-001/PXL_20261116_161842089.mp4 --
 ```
 
 Opens a camera window, a depth window and the 3D view at http://127.0.0.1:8766. Keys: `1`–`4` model,
-`r` input size, `s` flicker smoothing, `m` 3D mode (live frame / build map), `c` clear the map, `q` quit.
-`--source` takes a camera index (default `0`, the built-in camera) or a video file. On an M4 Pro,
-DA3-BASE runs at about 18 fps at 392 px and DA3-SMALL at about 30.
+`r` input size, `s` flicker smoothing, `m` 3D mode (live frame / build map), `c` clear the map, `z` belt
+zones, `q` quit. `--source` takes a camera index (default `0`, the built-in camera) or a video file. On an
+M4 Pro, DA3-BASE runs at about 18 fps at 392 px and DA3-SMALL at about 30.
+
+Both windows show the belt's four motor zones (Left, Mid-Left, Mid-Right, Right) in a band at waist
+height. Each zone covers a fifth of the image width, and the middle fifth is left out. A zone turns red
+when its nearest 10% of pixels is closer than `--zone-near` (default 0.5) times the frame's median depth;
+the number shown in each zone is that ratio. The depth is relative, so this is a placeholder until the
+camera gives metres. Webcams are mirrored by default and the zones follow the camera's own left and
+right; pass `--no-mirror` for a chest camera. `--headless` also prints how often each zone alerted.
 
 ## Depth maps and short clips
 

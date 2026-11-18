@@ -10,12 +10,19 @@ live 3D point cloud (http://127.0.0.1:8766). The 3D view has two modes:
                  using DA3's camera-pose output on [last keyframe, current frame] pairs.
                  Needs a model with a camera head (SMALL, BASE, LARGE-1.1). It drifts.
 
+Belt zones: both windows show the four motor zones from docs/design.md (Left, Mid-Left,
+Mid-Right, Right; straight ahead is left out) in a band at waist height. A zone turns red
+when its nearest 10% of pixels is closer than --zone-near (default 0.5) times the frame's
+median depth; the number in each zone is that ratio. Left and right are the camera's own
+view, so they stay right when the picture is mirrored. Use --no-mirror for a chest camera.
+
 Keys (with the camera or depth window focused):
     1 2 3 4   switch model: SMALL, BASE, MONO-LARGE, LARGE-1.1 (first switch loads it)
     r         cycle input resolution 280 / 392 / 504 px
     s         toggle flicker smoothing (depth window)
     m         toggle 3D mode: live frame / build map
     c         clear the map
+    z         toggle the belt zones
     q / Esc   quit
 
 Test without a camera:  uv run tools/live.py --source footage/clip.mp4 --headless 120
@@ -66,6 +73,11 @@ KEYFRAME_DIST = 0.15     # translation (in units of the first frame's median dep
 LUT = (matplotlib.colormaps["Spectral_r"](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)[:, ::-1]
 CAM_WIN, DEPTH_WIN = "DA3 camera", "DA3 depth"
 CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0])  # OpenCV camera axes (y down, z forward) -> three.js (y up, -z forward)
+# Belt zones (docs/design.md): four motors flank the central view, which gets no feedback.
+# Fractions of the image width in the camera's own (unmirrored) view.
+ZONES = [("Left", 0.0, 0.2), ("Mid-Left", 0.2, 0.4), ("Mid-Right", 0.6, 0.8), ("Right", 0.8, 1.0)]
+ZONE_BAND = (0.35, 0.65)  # rows checked, as fractions of the image height: about waist height
+ZONE_PERCENTILE = 10      # a zone's distance is the depth of its nearest 10% of pixels
 
 
 def nearest_multiple(x: int, p: int) -> int:
@@ -163,6 +175,30 @@ class DepthEngine:
         z = d[keep]
         pts = np.stack([(u[keep] - cx) / fx * z, (v[keep] - cy) / fy * z, z], axis=1)
         return pts.astype(np.float32), colours[keep]
+
+
+@dataclass
+class Zone:
+    name: str
+    x0: float    # left and right edges, as fractions of the displayed image width
+    x1: float
+    near: float  # zone distance / frame median depth
+    alert: bool
+
+
+def zone_states(depth: np.ndarray, near_frac: float, mirrored: bool) -> list[Zone]:
+    """Each zone's distance relative to the frame's median depth. A zone alerts when its
+    nearest part is closer than near_frac x the median. depth is as displayed; when the
+    display is mirrored, the camera's Left zone is on the right of it."""
+    h, w = depth.shape
+    band = depth[int(h * ZONE_BAND[0]):int(h * ZONE_BAND[1])]
+    median = max(float(np.median(depth)), 1e-6)
+    zones = []
+    for name, a, b in ZONES:
+        x0, x1 = (1 - b, 1 - a) if mirrored else (a, b)
+        near = float(np.percentile(band[:, int(w * x0):int(w * x1)], ZONE_PERCENTILE)) / median
+        zones.append(Zone(name, x0, x1, near, near < near_frac))
+    return zones
 
 
 def fallback_K(h: int, w: int) -> np.ndarray:
@@ -313,10 +349,12 @@ class Worker(threading.Thread):
         self.engine, self.hub = engine, hub
         self.model_key, self.res, self.smooth = model_key, res, smooth
         self.mode = "live"
+        self.zone_near = 0.5       # alert threshold, as a fraction of the frame's median depth
+        self.mirrored = False      # whether submitted frames are mirrored
         self.lock = threading.Lock()
         self.frame = None
         self.frame_id = 0
-        self.result = None         # (depth BGR image, frame_id)
+        self.result = None         # (depth BGR image, frame_id, zones)
         self.status = "starting"
         self.note = ""
         self.model_ms = None
@@ -419,6 +457,7 @@ class Worker(threading.Thread):
                 depth, pts, cols, pose, chunk, path_point = step(name, x, colours)
                 ms = (time.perf_counter() - t0) * 1000
                 vis = self.engine.colourise(depth, smooth)
+                zones = zone_states(depth, self.zone_near, self.mirrored)
             except Exception as e:  # show it in the window instead of silently freezing
                 self.status = f"error: {type(e).__name__}: {e}"[:90]
                 print(self.status, flush=True)
@@ -441,7 +480,7 @@ class Worker(threading.Thread):
                     "keyframes": self.n_keyframes if mode == "map" else 0, "note": self.note,
                 }, chunk, path_point)
             with self.lock:
-                self.result = (vis, fid)
+                self.result = (vis, fid, zones)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +500,21 @@ def draw_hud(img: np.ndarray, lines: list[str], footer: str) -> None:
     strip = img[y0:, : fw + 2 * pad]
     strip[:] = (strip * 0.35).astype(np.uint8)
     cv2.putText(img, footer, (pad, img.shape[0] - pad), font, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+
+
+def draw_zones(img: np.ndarray, zones: list[Zone]) -> None:
+    """Waist band outline, each zone's box and ratio; alerting zones in thick red."""
+    h, w = img.shape[:2]
+    y0, y1 = int(h * ZONE_BAND[0]), int(h * ZONE_BAND[1])
+    cv2.rectangle(img, (0, y0), (w - 1, y1), (255, 255, 0), 1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for z in zones:
+        x0, x1 = int(w * z.x0), int(w * z.x1) - 1
+        colour = (0, 0, 255) if z.alert else (230, 230, 230)
+        cv2.rectangle(img, (x0, y0), (x1, y1), colour, 3 if z.alert else 1)
+        for text, y in ((z.name, y1 - 34), (f"{z.near:.2f}", y1 - 10)):
+            cv2.putText(img, text, (x0 + 8, y), font, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(img, text, (x0 + 8, y), font, 0.6, colour, 2 if z.alert else 1, cv2.LINE_AA)
 
 
 def open_source(src: str, width: int, height: int, wait_s: float = 30) -> cv2.VideoCapture:
@@ -501,6 +555,7 @@ def headless(args, engine: DepthEngine) -> None:
     worker.mode = args.mode
     name = MODELS[args.model]
     times, n_pts = [], []
+    alerts, nearest = {z[0]: 0 for z in ZONES}, {z[0]: [] for z in ZONES}
     for i in range(args.headless):
         ok, bgr = cap.read()
         if not ok:
@@ -511,6 +566,9 @@ def headless(args, engine: DepthEngine) -> None:
         step = worker.map_step if args.mode == "map" and args.model in HAS_POSE else worker.live_step
         depth, pts, cols, pose, chunk, path_point = step(name, x, colours)
         engine.colourise(depth, args.smooth)
+        for z in zone_states(depth, args.zone_near, mirrored=False):
+            alerts[z.name] += z.alert
+            nearest[z.name].append(z.near)
         if pts is not None:
             hub.publish(pts, cols, pose, {}, chunk, path_point)
             n_pts.append(len(pts))
@@ -520,6 +578,9 @@ def headless(args, engine: DepthEngine) -> None:
     print(f"{name.split('/')[-1]} @ {args.res}px, 3D mode {args.mode}: median {np.median(times) * 1000:.1f} ms "
           f"= {1 / np.median(times):.1f} fps; {int(np.median(n_pts))} points/frame; "
           f"{worker.n_keyframes} keyframes, {len(hub.chunks)} map chunks; payload {len(payload) / 1e6:.1f} MB")
+    n = len(nearest[ZONES[0][0]])
+    print(f"zones (alert < {args.zone_near:.2f}x median depth), alerts out of {n} frames: " + ", ".join(
+        f"{k} {alerts[k]} (ratio {np.min(v):.2f}-{np.max(v):.2f})" for k, v in nearest.items()))
 
 
 def main() -> None:
@@ -535,6 +596,9 @@ def main() -> None:
     p.add_argument("--no-3d", dest="web", action="store_false", help="don't start the browser 3D view")
     p.add_argument("--no-browser", dest="open_browser", action="store_false", help="serve the 3D view but don't open a tab")
     p.add_argument("--port", type=int, default=8766)
+    p.add_argument("--zone-near", type=float, default=0.5, metavar="F",
+                   help="a belt zone alerts when its nearest part is closer than F x the frame's median depth")
+    p.add_argument("--no-zones", dest="zones", action="store_false", help="start with the belt zones hidden")
     p.add_argument("--headless", type=int, metavar="N", help="process N frames without windows and print timing")
     args = p.parse_args()
 
@@ -549,6 +613,8 @@ def main() -> None:
     hub = Hub()
     worker = Worker(engine, hub, args.model, args.res, args.smooth)
     worker.mode = args.mode
+    mirror = args.mirror and args.source.isdigit()
+    worker.zone_near, worker.mirrored = args.zone_near, mirror
     worker.start()
     if args.web:
         serve(hub, args.port)
@@ -559,9 +625,10 @@ def main() -> None:
     cv2.namedWindow(CAM_WIN, cv2.WINDOW_NORMAL)
     cv2.namedWindow(DEPTH_WIN, cv2.WINDOW_NORMAL)
     placed = False
-    depth_img, shown_id = None, -1
+    depth_img, shown_id, zones = None, -1, []
+    show_zones = args.zones
     last_log = time.perf_counter()
-    footer = "1-4 model  r res  s smooth  m 3D mode  c clear map  q quit"
+    footer = "1-4 model  r res  s smooth  m 3D mode  c clear map  z zones  q quit"
     print("Keys" + __doc__.split("Keys")[1].split("Test without")[0].rstrip(), flush=True)
 
     while True:
@@ -574,28 +641,35 @@ def main() -> None:
             break
         if bgr.shape[1] != args.width:
             bgr = cv2.resize(bgr, (args.width, round(bgr.shape[0] * args.width / bgr.shape[1])), interpolation=cv2.INTER_AREA)
-        if args.mirror and args.source.isdigit():
+        if mirror:
             bgr = cv2.flip(bgr, 1)
         worker.submit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        cv2.imshow(CAM_WIN, bgr)
 
         with worker.lock:
             result = worker.result
         if result is not None and result[1] != shown_id:
             depth_img = cv2.resize(result[0], (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
-            shown_id = result[1]
+            shown_id, zones = result[1], result[2]
         canvas = depth_img.copy() if depth_img is not None else np.zeros_like(bgr)
+        if show_zones:
+            draw_zones(bgr, zones)
+            draw_zones(canvas, zones)
+        cv2.imshow(CAM_WIN, bgr)
         name = MODELS[worker.model_key].split("/")[-1]
         speed = (f"{worker.fps:.1f} fps   model {worker.model_ms:.0f} ms"
                  if worker.fps is not None and worker.status == "running" else worker.status)
         mode = (f"3D: map, {worker.n_keyframes} keyframes" if worker.mode == "map" else "3D: live frame")
         lines = [f"{name}   {worker.res} px   smoothing {'on' if worker.smooth else 'off'}", speed, mode]
+        if show_zones:
+            lines.append(f"zones: alert < {worker.zone_near:.2f}x median depth")
         if worker.note:
             lines.append(worker.note)
         draw_hud(canvas, lines, footer)
         cv2.imshow(DEPTH_WIN, canvas)
         if time.perf_counter() - last_log > 5:
-            print(f"{name} {worker.res}px smoothing {'on' if worker.smooth else 'off'} {mode}: {speed}", flush=True)
+            alerting = ", ".join(z.name for z in zones if z.alert) or "none"
+            print(f"{name} {worker.res}px smoothing {'on' if worker.smooth else 'off'} {mode}: {speed}; "
+                  f"zone alerts: {alerting}", flush=True)
             last_log = time.perf_counter()
 
         if not placed:  # put the windows next to each other once, then leave them where the user drags them
@@ -619,6 +693,8 @@ def main() -> None:
             hub.command({"toggle_mode": True})
         elif key == ord("c"):
             hub.command({"clear": True})
+        elif key == ord("z"):
+            show_zones = not show_zones
         try:
             if any(cv2.getWindowProperty(w, cv2.WND_PROP_VISIBLE) < 1 for w in (CAM_WIN, DEPTH_WIN)):
                 break
