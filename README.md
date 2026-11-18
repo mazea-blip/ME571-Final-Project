@@ -1,7 +1,8 @@
 # Haptic Peripheral Vision Assist
 
 ME571 Medical Robotics final project: a wearable belt that warns people with peripheral vision loss about
-obstacles at their sides through vibration. The design is in `preproposal.pdf`.
+obstacles at their sides through vibration. The design, and what has changed since the pre-proposal
+(`preproposal.pdf`), is in [`docs/design.md`](docs/design.md).
 
 This repo holds the vision side. [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3)
 (DA3) turns chest-camera frames into depth maps that give the distance to obstacles in each peripheral
