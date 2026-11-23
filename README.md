@@ -75,8 +75,9 @@ Opens a camera window, a depth window and the 3D view at http://127.0.0.1:8766. 
 zones, `q` quit. `--source` takes a camera index (default `0`, the built-in camera) or a video file. On an
 M4 Pro, DA3-BASE runs at about 18 fps at 392 px and DA3-SMALL at about 30.
 
-Both windows show the belt's four motor zones (Left, Mid-Left, Mid-Right, Right) in a band at waist
-height. Each zone covers a fifth of the image width, and the middle fifth is left out. A zone turns red
+Both windows show six belt zones—three on the left (Far-Left, Left, Near-Left) and three on the right
+(Near-Right, Right, Far-Right)—in a band at waist height. The left and right bands cover 40% of the
+image width each, and the center 20% is left out. A zone turns red
 when its nearest 10% of pixels is closer than `--zone-near` (default 0.5) times the frame's median depth;
 the number shown in each zone is that ratio. Webcams are mirrored by default and the zones follow the
 camera's own left and right; pass `--no-mirror` for a chest camera. `--headless` also prints how often

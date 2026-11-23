@@ -3,7 +3,7 @@
     uv run tools/live.py           # MacBook camera, starts on DA3-BASE at 392 px
     uv run tools/live.py --model 1 --res 280
     uv run tools/live.py --model 5 --hfov 93 --no-mirror --source 1   # metres, belt camera (ELP, 93° wide)
-    uv run tools/live.py --no-view --model 5 --hfov 75 --source 0  # log close quadrants, no windows
+    uv run tools/live.py --no-view --model 5 --hfov 75 --source 0  # log close zones, no windows
 
 Windows: the camera, the depth map with a speed readout, and a browser tab with the
 live 3D point cloud (http://127.0.0.1:8766). The 3D view has two modes:
@@ -12,8 +12,8 @@ live 3D point cloud (http://127.0.0.1:8766). The 3D view has two modes:
                  using DA3's camera-pose output on [last keyframe, current frame] pairs.
                  Needs a model with a camera head (SMALL, BASE, LARGE-1.1). It drifts.
 
-Belt zones: both windows show the four motor zones from docs/design.md (Left, Mid-Left,
-Mid-Right, Right; straight ahead is left out) in a band at waist height. A zone turns red
+Belt zones: both windows show six motor zones (Far-Left, Left, Near-Left,
+Near-Right, Right, Far-Right; straight ahead is left out) in a band at waist height. A zone turns red
 when its nearest 10% of pixels is closer than --zone-near (default 0.5) times the frame's
 median depth; the number in each zone is that ratio. Left and right are the camera's own
 view, so they stay right when the picture is mirrored. Use --no-mirror for a chest camera.
@@ -86,9 +86,16 @@ KEYFRAME_DIST = 0.15     # translation (in units of the first frame's median dep
 LUT = (matplotlib.colormaps["Spectral_r"](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)[:, ::-1]
 CAM_WIN, DEPTH_WIN = "DA3 camera", "DA3 depth"
 CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0])  # OpenCV camera axes (y down, z forward) -> three.js (y up, -z forward)
-# Belt zones (docs/design.md): four motors flank the central view, which gets no feedback.
+# Belt zones (docs/design.md): three motors on each side flank the central view.
 # Fractions of the image width in the camera's own (unmirrored) view.
-ZONES = [("Left", 0.0, 0.2), ("Mid-Left", 0.2, 0.4), ("Mid-Right", 0.6, 0.8), ("Right", 0.8, 1.0)]
+ZONES = [
+    ("Far-Left", 0.0, 0.4 / 3),
+    ("Left", 0.4 / 3, 0.8 / 3),
+    ("Near-Left", 0.8 / 3, 0.4),
+    ("Near-Right", 0.6, 0.6 + 0.4 / 3),
+    ("Right", 0.6 + 0.4 / 3, 0.6 + 0.8 / 3),
+    ("Far-Right", 0.6 + 0.8 / 3, 1.0),
+]
 ZONE_BAND = (0.35, 0.65)  # rows checked, as fractions of the image height: about waist height
 ZONE_PERCENTILE = 10      # a zone's distance is the depth of its nearest 10% of pixels
 
