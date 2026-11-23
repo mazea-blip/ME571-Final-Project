@@ -51,10 +51,10 @@ buzz.
 
 | Part | Pre-proposal spec | Notes |
 |---|---|---|
-| Chest camera | 720p USB, 100° lens, angled ~10° down | ELP-USB100W07M-MHV100: OV9712 sensor, 1280×720, M7 lens sold as 100° but 93° horizontal and 98° diagonal per its spec sheet, so `--hfov 93` and a focal length of about 607 px at 1280 px wide. 30 fps at 1280×720 only in MJPEG (5 fps in YUY2). |
+| Chest camera | 720p USB, 100° lens, angled ~10° down | ELP-USB100W07M-MHV100: OV9712 sensor, 1280×720, M7 lens sold as 100° but 93° horizontal and 98° diagonal per its spec sheet, so `--hfov 93` and a focal length of about 607 px at 1280 px wide. 30 fps at 1280×720 only in MJPEG (10 fps in YUY2, measured on the Pi). |
 | ToF sensors | 2× VL53L1X at the hips, angled ~30° outward, 0–4 m | Shared I2C bus; separate XSHUT pins give each a unique address at startup. A third is kept as a spare. |
-| Controller | Raspberry Pi (a Pi 5 in the risk estimates) | Pocket unit, with the battery |
-| Power | 5 V / 3 A, 10,000 mAh bank in a vented pocket enclosure | About 3–4 hours of use |
+| Controller | Raspberry Pi (a Pi 5 in the risk estimates) | Pocket unit, with the battery. A Pi 5 (16 GB) on Ubuntu Server 24.04, set up as in [raspberry-pi.md](raspberry-pi.md). |
+| Power | 5 V / 3 A, 10,000 mAh bank in a vented pocket enclosure | About 3–4 hours of use. A Pi 5 is rated for 5 V / 5 A; on weaker supplies it browned out (see [Risks](#risks)). |
 | Motors | 4× 3 V coin vibration motors, two on each hip, none at the front | Driven through 2N2222 transistors with flyback diodes |
 
 Signal chain (Fig. 1 of the pre-proposal): camera and ToF sensors → Raspberry Pi (object detection and
@@ -76,12 +76,19 @@ From the pre-proposal:
 - Sunlight reduces ToF range.
 - A 10,000 mAh bank gives roughly 3–4 hours of use.
 
+Found since:
+
+- **Power.** Powered from a laptop's USB port, the Pi 5 logged undervoltage warnings and then lost power;
+  on a phone wall adapter its 5 V rail sagged to 4.7–4.9 V and it throttled its CPU. The 5 V / 3 A bank is
+  below the Pi 5's 5 V / 5 A rating, so test the belt's supply under full load. Details in
+  [raspberry-pi.md](raspberry-pi.md#power).
+
 ## Changes since the pre-proposal
 
 | | Pre-proposal | Now |
 |---|---|---|
 | Camera distance | YOLOv8n boxes plus a resolution and aperture calculation | Depth Anything 3 (DA3) depth maps, from the tools in `tools/`. YOLOv8n stays an option. |
-| Where the camera model runs | Raspberry Pi | A laptop. The Pi handles the ToF sensors and the motors. |
+| Where the camera model runs | Raspberry Pi | A laptop. The Pi handles the ToF sensors and the motors, and streams the camera. DA3-SMALL on the Pi 5's CPU managed about 1 fps at 280 px ([raspberry-pi.md](raspberry-pi.md#da3-on-the-pi-tried-and-dropped)). |
 
 On an M4 Pro laptop, DA3-BASE runs at about 18 fps at 392 px (see the [README](../README.md)), compared
 with the 5–10 fps the pre-proposal expected from YOLOv8n on a Pi 5.
@@ -92,8 +99,11 @@ with the 5–10 fps the pre-proposal expected from YOLOv8n on a Pi 5.
   real distances. Options: `DA3METRIC-LARGE` (needs the camera's focal length; model `5` in
   `tools/live.py`, accuracy not yet checked against a tape measure), or scaling the relative depth with
   the ToF readings in the Left and Right zones.
-- **Belt-to-laptop link.** How camera frames reach the laptop and zone distances get back to the Pi isn't
-  decided. Its delay adds to every camera-based warning.
+- **Belt-to-laptop link.** Camera frames now reach the laptop as an MJPEG stream over Wi-Fi from
+  ustreamer on the Pi, through an SSH tunnel: about 65 ms from the Pi to the laptop at 640×360 with one
+  viewer, but delay grows without limit at 1280×720, which needs more than the Wi-Fi carries
+  ([raspberry-pi.md](raspberry-pi.md#delay)). How zone distances get back to the Pi isn't decided. The
+  link's delay adds to every camera-based warning.
 - **Which ToF sensor.** The pre-proposal text names the VL53L1X (one distance per sensor); its Fig. 1
   labels the VL53L5CX (an 8×8 grid of distances per sensor).
 - **Zone boundaries.** The pre-proposal doesn't give the angle each zone covers or how wide the central

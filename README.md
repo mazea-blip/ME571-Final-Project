@@ -7,7 +7,8 @@ obstacles at their sides through vibration. The design, and what has changed sin
 This repo holds the vision side. [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3)
 (DA3) turns chest-camera frames into depth maps that give the distance to obstacles in each peripheral
 zone. YOLOv8n detection from the preproposal stays an option on top of it. A laptop runs the model; the
-belt's Raspberry Pi handles the ToF sensors and the motors.
+belt's Raspberry Pi handles the ToF sensors and the motors and streams the camera to the laptop. How the
+Pi is set up, its power needs and the camera stream are in [`docs/raspberry-pi.md`](docs/raspberry-pi.md).
 
 ## Setup
 
@@ -43,7 +44,11 @@ Models download from Hugging Face on first use. Put photos and clips in `footage
 uv run tools/live.py
 uv run tools/live.py --model 5                    # metric model: distances in metres
 uv run tools/live.py --source footage/Photos-1-001/PXL_20261116_161842089.mp4 --headless 120   # timing, no camera
+uv run tools/live.py --source http://127.0.0.1:8080/stream --model 5 --hfov 93   # belt camera, streamed from the Pi
 ```
+
+The last line needs the Pi's camera stream and an SSH tunnel; see
+[docs/raspberry-pi.md](docs/raspberry-pi.md#streaming-the-camera-to-the-laptop).
 
 ## Headless quadrant logging
 
