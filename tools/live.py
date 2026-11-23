@@ -3,6 +3,7 @@
     uv run tools/live.py           # MacBook camera, starts on DA3-BASE at 392 px
     uv run tools/live.py --model 1 --res 280
     uv run tools/live.py --model 5 --hfov 93 --no-mirror --source 1   # metres, belt camera (ELP, 93° wide)
+    uv run tools/live.py --no-view --model 5 --hfov 75 --source 0  # log close quadrants, no windows
 
 Windows: the camera, the depth map with a speed readout, and a browser tab with the
 live 3D point cloud (http://127.0.0.1:8766). The 3D view has two modes:
@@ -36,6 +37,7 @@ Test without a camera:  uv run tools/live.py --source footage/clip.mp4 --headles
 """
 
 import os
+import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # torch + pycolmap both ship libomp
 os.environ.setdefault("DA3_LOG_LEVEL", "ERROR")
@@ -49,6 +51,7 @@ import time
 import warnings
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -108,6 +111,10 @@ class DepthEngine:
 
     def __init__(self, device: str, hfov: float = FALLBACK_HFOV):
         self.device = device
+        if device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self.hfov = hfov  # camera's horizontal field of view, for models that don't predict it
         self.models: dict[str, DepthAnything3] = {}
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
@@ -136,7 +143,8 @@ class DepthEngine:
         return (x - self.mean) / self.std, colours
 
     def run(self, name: str, xs: list[torch.Tensor]) -> Result:
-        out = self.model(name).forward(torch.stack(xs)[None], None, None, [], False, False, "first")
+        with torch.inference_mode():
+            out = self.model(name).forward(torch.stack(xs)[None], None, None, [], False, False, "first")
         n, (h, w) = len(xs), xs[0].shape[-2:]
         get = lambda k, shape: out[k].float().reshape(shape).cpu().numpy() if k in out else None  # noqa: E731
         depth, K = get("depth", (n, h, w)), get("intrinsics", (n, 3, 3))
@@ -221,6 +229,55 @@ def zone_states(depth: np.ndarray, threshold: float, mirrored: bool, metres: boo
 def fallback_K(h: int, w: int, hfov: float = FALLBACK_HFOV) -> np.ndarray:
     f = (w / 2) / np.tan(np.radians(hfov / 2))
     return np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], np.float32)
+
+
+def load_zone_config(path: str) -> dict:
+    """Read configurable distance bands and log settings from JSON at startup."""
+    defaults = {
+        "very_close_m": 0.10,
+        "close_m": 0.30,
+        "slightly_close_m": 0.50,
+        "log_directory": "outputs",
+        "log_repeat_seconds": 1.0,
+    }
+    config_path = Path(path)
+    if not config_path.exists():
+        return defaults
+    with config_path.open("r", encoding="utf-8") as config_file:
+        loaded = json.load(config_file)
+    config = {**defaults, **loaded}
+    boundaries = (
+        config["very_close_m"],
+        config["close_m"],
+        config["slightly_close_m"],
+    )
+    if not all(isinstance(value, (int, float)) for value in boundaries):
+        raise ValueError("Distance boundaries in the zone config must be numbers.")
+    if not 0 < boundaries[0] <= boundaries[1] <= boundaries[2]:
+        raise ValueError(
+            "Distance boundaries must satisfy 0 < very_close <= close <= slightly_close."
+        )
+    if config["log_repeat_seconds"] < 0:
+        raise ValueError("log_repeat_seconds cannot be negative.")
+    return config
+
+
+def distance_band(distance_m: float, config: dict) -> str | None:
+    """Return the configured close-object severity for a measured distance."""
+    if distance_m <= config["very_close_m"]:
+        return "ZONE 1"
+    if distance_m <= config["close_m"]:
+        return "ZONE 2"
+    if distance_m <= config["slightly_close_m"]:
+        return "ZONE 3"
+    return None
+
+
+def timestamped_log_path(log_directory: str) -> Path:
+    """Create a unique text-log name using the local startup timestamp."""
+    directory = Path(log_directory)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return directory / f"live_log_{timestamp}.txt"
 
 
 def to4(ext: np.ndarray) -> np.ndarray:
@@ -361,10 +418,19 @@ class Keyframe:
 class Worker(threading.Thread):
     """Runs the model on the newest camera frame, as fast as it can, off the GUI thread."""
 
-    def __init__(self, engine: DepthEngine, hub: Hub, model_key: str, res: int, smooth: bool):
+    def __init__(
+        self,
+        engine: DepthEngine,
+        hub: Hub,
+        model_key: str,
+        res: int,
+        smooth: bool,
+        publish_3d: bool = True,
+    ):
         super().__init__(daemon=True)
         self.engine, self.hub = engine, hub
         self.model_key, self.res, self.smooth = model_key, res, smooth
+        self.publish_3d = publish_3d
         self.mode = "live"
         self.zone_near = 0.5       # alert threshold, as a fraction of the frame's median depth
         self.zone_metres = 1.0     # alert threshold in metres, for metric models
@@ -404,6 +470,8 @@ class Worker(threading.Thread):
     def live_step(self, name, x, colours):
         r = self.engine.run(name, [x])
         depth = r.depth[0]
+        if not self.publish_3d:
+            return depth, None, None, None, None, None
         K = r.K[0]
         # intrinsics are predicted per frame; smooth the focal length so the cloud doesn't breathe
         self.K_ema = K if self.K_ema is None else 0.9 * self.K_ema + 0.1 * K
@@ -540,13 +608,23 @@ def open_source(src: str, width: int, height: int, wait_s: float = 30) -> cv2.Vi
         cap = cv2.VideoCapture(src)
         ok, _ = cap.read() if cap.isOpened() else (False, None)
     else:
+        # Numeric sources are camera indices. Use the native backend for the host
+        # platform instead of trying macOS AVFoundation on Windows or Linux.
+        if sys.platform == "win32":
+            backend = cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_V4L2
+
         # On first use macOS shows a camera permission dialog, but OpenCV fails immediately
         # instead of waiting for the answer. Keep retrying while the dialog is up.
         deadline, told = time.time() + wait_s, False
         while True:
-            cap = cv2.VideoCapture(int(src), cv2.CAP_AVFOUNDATION)
+            cap = cv2.VideoCapture(int(src), backend)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             ok, _ = cap.read() if cap.isOpened() else (False, None)
             if ok or time.time() > deadline:
                 break
@@ -569,7 +647,7 @@ def headless(args, engine: DepthEngine) -> None:
     """Process N frames with no windows and print timing, for testing without a camera."""
     cap = open_source(args.source, args.width, args.height)
     hub = Hub()
-    worker = Worker(engine, hub, args.model, args.res, args.smooth)
+    worker = Worker(engine, hub, args.model, args.res, args.smooth, publish_3d=args.web)
     worker.mode = args.mode
     name = MODELS[args.model]
     metric = name in METRIC
@@ -594,14 +672,104 @@ def headless(args, engine: DepthEngine) -> None:
         if i >= 5:
             times.append(time.perf_counter() - t0)
     payload = hub.snapshot(0, -1, 0)
+    points_summary = f"{int(np.median(n_pts))} points/frame" if n_pts else "point cloud disabled"
     print(f"{name.split('/')[-1]} @ {args.res}px, 3D mode {args.mode}: median {np.median(times) * 1000:.1f} ms "
-          f"= {1 / np.median(times):.1f} fps; {int(np.median(n_pts))} points/frame; "
+          f"= {1 / np.median(times):.1f} fps; {points_summary}; "
           f"{worker.n_keyframes} keyframes, {len(hub.chunks)} map chunks; payload {len(payload) / 1e6:.1f} MB")
     n = len(nearest[ZONES[0][0]])
     rule = f"{args.zone_metres:.2f} m (hfov {args.hfov:.0f}°)" if metric else f"{args.zone_near:.2f}x median depth"
     unit = (" m", "nearest") if metric else ("", "ratio")
     print(f"zones (alert < {rule}), alerts out of {n} frames: " + ", ".join(
         f"{k} {alerts[k]} ({unit[1]} {np.min(v):.2f}-{np.max(v):.2f}{unit[0]})" for k, v in nearest.items()))
+
+
+def run_no_view(args, engine: DepthEngine, zone_config: dict) -> None:
+    """Run continuously without OpenCV windows and append triggered quadrant events."""
+    if MODELS[args.model] not in METRIC:
+        raise SystemExit(
+            "Headless zone logging requires the metric model: "
+            "use --model 5 and a calibrated --hfov."
+        )
+
+    cap = open_source(args.source, args.width, args.height)
+    hub = Hub()
+    worker = Worker(engine, hub, args.model, args.res, args.smooth, publish_3d=False)
+    worker.mode = "live"
+    worker.mirrored = args.mirror and args.source.isdigit()
+    worker.start()
+
+    log_path = timestamped_log_path(zone_config["log_directory"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", newline="", encoding="utf-8")
+
+    last_logged = {}
+    last_status_print = 0.0
+    print(
+        f"Running headless; logging <= {zone_config['slightly_close_m']:.2f} m "
+        f"events to {log_path}",
+        flush=True,
+    )
+    try:
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                if not args.source.isdigit():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                print("camera stopped delivering frames", flush=True)
+                break
+            if bgr.shape[1] != args.width:
+                bgr = cv2.resize(
+                    bgr,
+                    (args.width, round(bgr.shape[0] * args.width / bgr.shape[1])),
+                    interpolation=cv2.INTER_AREA,
+                )
+            if worker.mirrored:
+                bgr = cv2.flip(bgr, 1)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            worker.submit(rgb)
+
+            with worker.lock:
+                result = worker.result
+            if result is None:
+                time.sleep(0.01)
+                continue
+
+            zones = result[2]
+            now = time.monotonic()
+            if now - last_status_print >= 5.0:
+                distances = ", ".join(
+                    f"{zone.name}={zone.near:.3f} m" for zone in zones
+                )
+                print(f"Nearest zone distances: {distances}", flush=True)
+                last_status_print = now
+            for zone in zones:
+                band = distance_band(zone.near, zone_config) if zone.metres else None
+                if band is None:
+                    continue
+                last_time = last_logged.get(zone.name)
+                if (
+                    last_time is not None
+                    and now - last_time < zone_config["log_repeat_seconds"]
+                ):
+                    continue
+                timestamp = datetime.now().isoformat(timespec="milliseconds")
+                log_file.write(
+                    f"{timestamp} | {zone.name} | {band} | {zone.near:.3f} m\n"
+                )
+                log_file.flush()
+                last_logged[zone.name] = now
+                print(
+                    f"{timestamp} {zone.name} {band} {zone.near:.3f} m",
+                    flush=True,
+                )
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        print("Stopping headless detector.", flush=True)
+    finally:
+        worker.running = False
+        cap.release()
+        log_file.close()
 
 
 def main() -> None:
@@ -626,12 +794,18 @@ def main() -> None:
                    help="with the metric model, a zone alerts when its nearest part is closer than M metres")
     p.add_argument("--no-zones", dest="zones", action="store_false", help="start with the belt zones hidden")
     p.add_argument("--headless", type=int, metavar="N", help="process N frames without windows and print timing")
+    p.add_argument("--no-view", action="store_true", help="run without camera/depth windows")
+    p.add_argument("--config", default="zone_config.json",
+                   help="JSON file containing distance bands and event-log settings")
     args = p.parse_args()
+    zone_config = load_zone_config(args.config)
 
     device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
     engine = DepthEngine(device, args.hfov)
     print(f"loading {MODELS[args.model]} on {device}", flush=True)
     engine.model(MODELS[args.model])
+    if args.no_view:
+        return run_no_view(args, engine, zone_config)
     if args.headless:
         return headless(args, engine)
 

@@ -1,0 +1,7 @@
+{
+  "very_close_m": 0.10,
+  "close_m": 0.30,
+  "slightly_close_m": 0.50,
+  "log_directory": "outputs",
+  "log_repeat_seconds": 1.0
+}

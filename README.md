@@ -45,6 +45,31 @@ uv run tools/live.py --model 5                    # metric model: distances in m
 uv run tools/live.py --source footage/Photos-1-001/PXL_20261116_161842089.mp4 --headless 120   # timing, no camera
 ```
 
+## Headless quadrant logging
+
+Run the metric model without camera or depth windows:
+
+```sh
+uv run tools/live.py --no-view --model 5 --hfov 75 --source 0
+```
+
+Use `--source 1` for an external USB camera. Edit `zone_config.json` to change the
+thresholds or log file:
+
+```json
+{
+  "very_close_m": 0.10,
+  "close_m": 0.30,
+  "slightly_close_m": 0.50,
+  "log_directory": "outputs",
+  "log_repeat_seconds": 1.0
+}
+```
+
+Triggered quadrants are appended to a text log with their timestamp, quadrant name,
+closeness zone, and estimated distance. Objects farther than `slightly_close_m` are ignored.
+At every run, a file named `outputs/live_log_YYYYMMDD_HHMMSS.txt` is created.
+
 Opens a camera window, a depth window and the 3D view at http://127.0.0.1:8766. Keys: `1`–`5` model,
 `r` input size, `s` flicker smoothing, `m` 3D mode (live frame / build map), `c` clear the map, `z` belt
 zones, `q` quit. `--source` takes a camera index (default `0`, the built-in camera) or a video file. On an
